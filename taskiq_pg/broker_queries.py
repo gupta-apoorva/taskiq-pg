@@ -201,11 +201,13 @@ SET heartbeat_at = NOW()
 WHERE id = ANY($1::int[]) AND status = '{MessageStatus.ACTIVE.value}'
 """
 
-# TTL = completed-retention window.
+# TTL = completed-retention window. $3 is the attempt count the caller was given at
+# claim: only the delivery that owns the row may finish it, or a late ack from a
+# reclaimed worker would complete whatever attempt holds the row now.
 COMPLETE_MESSAGE_QUERY = f"""
 UPDATE {{table_name}}
 SET status = '{MessageStatus.COMPLETED.value}', expire_at = NOW() + ($1::INTEGER * INTERVAL '1 second')
-WHERE id = $2 AND status = '{MessageStatus.ACTIVE.value}'
+WHERE id = $2 AND status = '{MessageStatus.ACTIVE.value}' AND retry_count = $3::INTEGER
 """  # noqa: E501
 
 # Reclaim rows whose lease went stale (worker presumed dead). $1: timeout secs,
@@ -226,7 +228,10 @@ WITH stuck_messages AS (
 ),
 capped AS (
     SELECT m.id,
+           -- Length-bounded: a wider value overflows the cast and fails the sweep,
+           -- stranding every stale row it selected.
            CASE WHEN m.labels->>'max_retries' ~ '^-?\\d+$'
+                     AND char_length(m.labels->>'max_retries') <= 9
                 THEN (m.labels->>'max_retries')::INTEGER
                 ELSE $2::INTEGER
            END AS cap,

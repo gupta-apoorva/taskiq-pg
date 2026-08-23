@@ -301,6 +301,7 @@ class AsyncpgBroker(AsyncBroker):
                     continue
 
                 message_id = message_row["id"]
+                attempts = message_row["retry_count"]
                 # Per-message ttl label overrides broker default at completion.
                 resolved_ttl = self._resolve_ttl(message_row["labels"])
                 if resolved_ttl < 0:
@@ -314,21 +315,19 @@ class AsyncpgBroker(AsyncBroker):
                     msg = "message is not a string"
                     raise ValueError(msg)
                 message_data = self._inject_delivery_meta(
-                    message_str, message_id, message_row["retry_count"]
+                    message_str, message_id, attempts
                 )
 
                 self._inflight_ids.add(message_id)
 
                 async def ack(
-                    *, _message_id: int = message_id, _ttl: int = resolved_ttl
+                    *,
+                    _message_id: int = message_id,
+                    _ttl: int = resolved_ttl,
+                    _attempts: int = attempts,
                 ) -> None:
                     if self.write_pool is None:
                         raise ValueError("Call startup before starting listening.")
-
-                    # Retry/dead-letter already released the row; the next attempt
-                    # owns it now.
-                    if _message_id not in self._inflight_ids:
-                        return
 
                     # Keep the lease refreshed until completion lands; discarding
                     # early lets the sweeper reclaim a mid-ack row -> dup work.
@@ -337,6 +336,7 @@ class AsyncpgBroker(AsyncBroker):
                             COMPLETE_MESSAGE_QUERY.format(table_name=self.table_name),
                             _ttl,
                             _message_id,
+                            _attempts,
                         )
                     self._inflight_ids.discard(_message_id)
 

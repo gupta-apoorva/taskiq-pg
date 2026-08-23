@@ -92,8 +92,9 @@ async def test_spent_attempts_dead_letter(
     cap: dict[str, object],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The budget is the label where there is one, the middleware default otherwise."""
-    middleware = OrderedRetryMiddleware(default_retry_count=1, default_delay=0)
+    """The budget is the label where there is one, the broker's cap otherwise."""
+    asyncpg_broker.max_retry_attempts = 1  # the sweeper's cap, shared by both paths
+    middleware = OrderedRetryMiddleware(default_retry_count=99, default_delay=0)
     middleware.set_broker(asyncpg_broker)
     message = await _deliver(asyncpg_broker, {"retry_on_error": True, **cap})
     result = _failure()
@@ -163,7 +164,11 @@ async def test_retry_holds_its_slot_in_an_ordered_group(
 async def test_the_ack_after_a_retry_spares_the_next_attempt(
     asyncpg_broker: AsyncpgBroker,
 ) -> None:
-    """The receiver acks a delivery we already requeued; it must not complete it."""
+    """The receiver acks a delivery we already requeued; it must not complete it.
+
+    Redelivery goes through the same listener, so the ack is stale against an attempt
+    this very process is holding.
+    """
     middleware = OrderedRetryMiddleware(default_delay=0)
     middleware.set_broker(asyncpg_broker)
     await _kick(asyncpg_broker, {"retry_on_error": True})
@@ -174,13 +179,14 @@ async def test_the_ack_after_a_retry_spares_the_next_attempt(
     row_id = int(message.labels[ROW_ID_LABEL])
 
     await middleware.on_error(message, _failure(), ValueError("boom"))
-    reclaimed = await asyncpg_broker._dequeue_message()  # the next attempt claims it
-    assert reclaimed is not None and reclaimed["retry_count"] == 2
+    redelivered = await asyncio.wait_for(listener.__anext__(), timeout=5)
+    assert _delivered(asyncpg_broker, redelivered.data).labels[ATTEMPTS_LABEL] == 2
 
-    await maybe_awaitable(delivered.ack())
+    await maybe_awaitable(delivered.ack())  # attempt 1, long past owning the row
+    assert await _status(asyncpg_broker, row_id) == "active"  # still attempt 2's
 
-    assert await _status(asyncpg_broker, row_id) == "active"  # still the next attempt's
-    assert await asyncpg_broker.retry_in_place(row_id, 2, 0.0)  # it can still report
+    await maybe_awaitable(redelivered.ack())  # the owner's ack lands
+    assert await _status(asyncpg_broker, row_id) == "completed"
     await listener.aclose()
 
 

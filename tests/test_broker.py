@@ -573,7 +573,12 @@ async def _sweep_with_cap(
     [
         (2, 10, 2, "dead"),  # the label overrules a laxer default
         (-1, 1, 99, "queued"),  # forever: no attempt count exhausts it
-        *[(junk, 5, 5, "dead") for junk in ("many", True, 1.5, None)],  # ignored
+        # Ignored: not an integer, or too wide for the cast -- which would otherwise
+        # abort the sweep and strand every stale row in the batch.
+        *[
+            (junk, 5, 5, "dead")
+            for junk in ("many", True, 1.5, None, "9" * 10, "-" + "9" * 10)
+        ],
     ],
 )
 async def test_sweep_caps_attempts_by_label(
@@ -682,7 +687,10 @@ async def test_dead_worker_reclaim_and_reprocess(
 
     assert asyncpg_broker.write_pool is not None
     _ = await asyncpg_broker.write_pool.execute(
-        COMPLETE_MESSAGE_QUERY.format(table_name=tbl), asyncpg_broker.message_ttl, mid
+        COMPLETE_MESSAGE_QUERY.format(table_name=tbl),
+        asyncpg_broker.message_ttl,
+        mid,
+        second["retry_count"],
     )
     final = await conn.fetchval(
         f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
@@ -794,6 +802,7 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
             COMPLETE_MESSAGE_QUERY.format(table_name=tbl),
             asyncpg_broker.message_ttl,
             row_a["id"],
+            row_a["retry_count"],
         )
         async with conn_b.transaction():
             row_b3 = await asyncpg_broker._claim_on(conn_b)
@@ -861,7 +870,7 @@ async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> 
                 claimed.append(int(row["id"]))
                 await asyncio.sleep(0)  # force a scheduling point while "active"
                 active_now -= 1
-                await conn.execute(complete_sql, ttl, row["id"])
+                await conn.execute(complete_sql, ttl, row["id"], row["retry_count"])
         finally:
             await conn.close()
 
@@ -903,13 +912,14 @@ async def _kick(broker: AsyncpgBroker, name: str, group_key: Optional[str]) -> N
     )
 
 
-async def _complete(broker: AsyncpgBroker, row_id: int) -> None:
+async def _complete(broker: AsyncpgBroker, row_id: int, attempts: int = 1) -> None:
     """Ack a claimed row so its group frees up."""
     assert broker.write_pool is not None
     _ = await broker.write_pool.execute(
         COMPLETE_MESSAGE_QUERY.format(table_name=broker.table_name),
         broker.message_ttl,
         row_id,
+        attempts,
     )
 
 
@@ -1016,7 +1026,7 @@ async def test_ordered_group_does_not_block_other_groups(
     claimed = set()
     while (row := await asyncpg_broker._dequeue_message()) is not None:
         claimed.add(str(row["task_name"]))
-        await _complete(asyncpg_broker, int(row["id"]))
+        await _complete(asyncpg_broker, int(row["id"]), int(row["retry_count"]))
 
     assert claimed == {"runnable", "ungrouped"}
 
@@ -1104,7 +1114,7 @@ async def test_dead_row_halts_only_its_own_group(
     claimed = set()
     while (row := await asyncpg_broker._dequeue_message()) is not None:
         claimed.add(str(row["task_name"]))
-        await _complete(asyncpg_broker, int(row["id"]))
+        await _complete(asyncpg_broker, int(row["id"]), int(row["retry_count"]))
     assert claimed == {"runnable"}
 
 

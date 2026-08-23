@@ -55,7 +55,8 @@ class OrderedRetryMiddleware(SmartRetryMiddleware):
         broker = cast(AsyncpgBroker, self.broker)
         row_id = int(message.labels[ROW_ID_LABEL])
         attempts = int(message.labels[ATTEMPTS_LABEL])
-        max_retries = int(message.labels.get("max_retries", self.default_retry_count))
+        # Broker's cap, not default_retry_count: the sweeper reads the same one.
+        max_retries = int(message.labels.get("max_retries", broker.max_retry_attempts))
 
         if max_retries < 0 or attempts < max_retries:
             _ = await broker.retry_in_place(

@@ -192,8 +192,9 @@ async def relay() -> None: ...
 
 It subclasses `SmartRetryMiddleware` and takes the same labels and options; use it
 instead of, not alongside, that middleware. It needs `AsyncpgBroker` and raises on any
-other. `max_retries=-1` retries forever. Attempts come from the row, so the middleware
-and the sweeper share one budget; a message that runs out is marked dead.
+other. `max_retries=-1` retries forever; without the label the budget is the broker's
+`max_retry_attempts`. Attempts come from the row, so the middleware and the sweeper
+share one budget; a message that runs out is marked dead.
 
 Keep the worker's ack type at `when_saved` (the default) or `when_executed`. Retrying
 needs the row still held; `when_received` acks it before the task runs, and retries stop
