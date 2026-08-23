@@ -99,7 +99,9 @@ async def mutex_drill(groups: int = 2, backlog: int = 800, workers: int = 8) -> 
                     if int(active) > 1:
                         violations.append((str(row["group_key"]), int(active)))
                     await asyncio.sleep(0.005)
-                    await conn.execute(complete_sql, broker.message_ttl, row["id"])
+                    await conn.execute(
+                        complete_sql, broker.message_ttl, row["id"], row["retry_count"]
+                    )
             finally:
                 await conn.close()
 
@@ -168,7 +170,9 @@ async def ordered_drill(
                         )
                         continue
                     done[str(row["group_key"])].append(int(row["id"]))
-                    await conn.execute(complete_sql, broker.message_ttl, row["id"])
+                    await conn.execute(
+                        complete_sql, broker.message_ttl, row["id"], row["retry_count"]
+                    )
             finally:
                 await conn.close()
 
@@ -234,7 +238,9 @@ async def orphan_drill(
                         continue
                     idle = 0
                     delivered.append(int(row["id"]))
-                    await conn.execute(complete_sql, broker.message_ttl, row["id"])
+                    await conn.execute(
+                        complete_sql, broker.message_ttl, row["id"], row["retry_count"]
+                    )
             finally:
                 await conn.close()
 

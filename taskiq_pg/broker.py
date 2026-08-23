@@ -234,6 +234,12 @@ class AsyncpgBroker(AsyncBroker):
             ordered = self._resolve_ordered(message.labels)
             if ordered and group_key is None:
                 raise ValueError("`ordered` label requires a `group_key`")
+            # The sweeper casts this straight to INTEGER; reject it here instead.
+            cap = message.labels.get("max_retries")
+            if cap is not None and (
+                isinstance(cap, (bool, float)) or abs(int(cap)) > 2**31 - 1
+            ):
+                raise ValueError(f"`max_retries` label must be an int, got {cap!r}")
             delay_value = message.labels.get("delay")
 
             if delay_value is not None:

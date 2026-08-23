@@ -190,11 +190,17 @@ broker = AsyncpgBroker(dsn).with_middlewares(OrderedRetryMiddleware(default_dela
 async def relay() -> None: ...
 ```
 
-It subclasses `SmartRetryMiddleware` and takes the same labels and options; use it
-instead of, not alongside, that middleware. It needs `AsyncpgBroker` and raises on any
-other. `max_retries=-1` retries forever; without the label the budget is the broker's
-`max_retry_attempts`. Attempts come from the row, so the middleware and the sweeper
-share one budget; a message that runs out is marked dead.
+It subclasses `SmartRetryMiddleware` and takes the same labels and delay options, but
+**it is not a drop-in replacement** — read the migration note in `UPGRADE_NOTES.md`
+before swapping. In short: `default_retry_count` is inherited but does not set the cap.
+The budget is the `max_retries` label, or the broker's `max_retry_attempts` without one,
+because the sweeper has to cap a crashed attempt with no middleware in the loop. Both
+read the same two numbers, so a message ends the same way whether it failed or crashed.
+
+Use it instead of, not alongside, `SmartRetryMiddleware`. It needs `AsyncpgBroker` and
+raises on any other. `max_retries` must be an int and is rejected at `kick` otherwise;
+`-1` retries forever. Attempts come from the row, so a message that runs out is marked
+dead.
 
 Keep the worker's ack type at `when_saved` (the default) or `when_executed`. Retrying
 needs the row still held; `when_received` acks it before the task runs, and retries stop

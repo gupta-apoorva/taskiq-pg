@@ -213,9 +213,8 @@ WHERE id = $2 AND status = '{MessageStatus.ACTIVE.value}' AND retry_count = $3::
 # Reclaim rows whose lease went stale (worker presumed dead). $1: timeout secs,
 # $2: max_retry_attempts fallback. Reads the attempt count, never bumps it -- the
 # claim does that. A row that has burned its attempts is parked in 'dead' (terminal,
-# excluded from dequeue) instead of looping forever. The per-message `max_retries`
-# label wins where it parses as an integer; negative means retry forever. JSONB per
-# row is fine here: at most 100 rows a sweep, unlike the claim's candidate scan.
+# excluded from dequeue) instead of looping forever. A per-message `max_retries` label
+# wins over $2; negative means retry forever. kick() validates it, so the cast is bare.
 SWEEP_MESSAGES_QUERY = f"""
 WITH stuck_messages AS (
     SELECT id
@@ -228,13 +227,7 @@ WITH stuck_messages AS (
 ),
 capped AS (
     SELECT m.id,
-           -- Length-bounded: a wider value overflows the cast and fails the sweep,
-           -- stranding every stale row it selected.
-           CASE WHEN m.labels->>'max_retries' ~ '^-?\\d+$'
-                     AND char_length(m.labels->>'max_retries') <= 9
-                THEN (m.labels->>'max_retries')::INTEGER
-                ELSE $2::INTEGER
-           END AS cap,
+           coalesce((m.labels->>'max_retries')::INTEGER, $2::INTEGER) AS cap,
            m.retry_count
     FROM {{table_name}} m
     JOIN stuck_messages s ON s.id = m.id

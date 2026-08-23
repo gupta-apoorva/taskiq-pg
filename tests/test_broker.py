@@ -573,20 +573,27 @@ async def _sweep_with_cap(
     [
         (2, 10, 2, "dead"),  # the label overrules a laxer default
         (-1, 1, 99, "queued"),  # forever: no attempt count exhausts it
-        # Ignored: not an integer, or too wide for the cast -- which would otherwise
-        # abort the sweep and strand every stale row in the batch.
-        *[
-            (junk, 5, 5, "dead")
-            for junk in ("many", True, 1.5, None, "9" * 10, "-" + "9" * 10)
-        ],
+        (None, 5, 5, "dead"),  # absent: the broker's cap applies
     ],
 )
 async def test_sweep_caps_attempts_by_label(
     asyncpg_broker: AsyncpgBroker, cap: Any, default: int, attempts: int, expected: str
 ) -> None:
-    """`max_retries` wins where it parses as an integer, else the broker default."""
+    """`max_retries` wins over the broker default when the label is set."""
     asyncpg_broker.max_retry_attempts = default
     assert await _sweep_with_cap(asyncpg_broker, cap, attempts) == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cap", ["many", True, 1.5, "9" * 10, -(2**31) - 1])
+async def test_max_retries_label_validation(
+    asyncpg_broker: AsyncpgBroker, cap: Any
+) -> None:
+    """The sweeper casts the label to INTEGER, so a bad one fails at enqueue."""
+    with pytest.raises(ValueError):
+        await asyncpg_broker.kick(
+            make_message(asyncpg_broker, labels={"max_retries": cap})
+        )
 
 
 @pytest.mark.anyio
