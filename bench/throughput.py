@@ -112,11 +112,13 @@ async def _count_rows() -> int:
     return int(value or 0)
 
 
-async def _attempt_stats() -> tuple[int, int]:
-    """Total attempts executed and messages that burned their budget."""
+async def _attempt_stats(after_id: int) -> tuple[int, int]:
+    """Attempts executed and messages that burned their budget, sentinel excluded."""
     row = await broker.write_pool.fetchrow(
         f"SELECT coalesce(sum(retry_count), 0) AS attempts, "
-        f"count(*) FILTER (WHERE status = 'dead') AS dead FROM {TABLE}"
+        f"count(*) FILTER (WHERE status = 'dead') AS dead "
+        f"FROM {TABLE} WHERE id > $1",
+        after_id,
     )
     return (int(row["attempts"]), int(row["dead"])) if row else (0, 0)
 
@@ -348,6 +350,12 @@ async def _run(args: argparse.Namespace) -> int:
             return 1
         print("worker ready; enqueuing tasks...")
 
+        # Everything up to here is readiness traffic; stats count only what follows.
+        last_setup_id = int(
+            await broker.write_pool.fetchval(
+                f"SELECT coalesce(max(id), 0) FROM {TABLE}"
+            )
+        )
         kick_start = time.monotonic()
         await _kick_many(
             args.count,
@@ -359,7 +367,7 @@ async def _run(args: argparse.Namespace) -> int:
         await _drain(args.drain_timeout, args.stall_timeout)
         total_elapsed = time.monotonic() - kick_start
 
-        attempts, dead = await _attempt_stats()
+        attempts, dead = await _attempt_stats(last_setup_id)
         _print_report(args, total_elapsed, attempts, dead)
         return 0
     finally:
