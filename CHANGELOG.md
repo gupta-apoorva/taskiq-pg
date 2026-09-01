@@ -8,6 +8,8 @@
 * Add message states (queued, active, completed) for better tracking
 * Add group-based job coordination to prevent concurrent execution of related tasks
 * Add opt-in FIFO within a group via the `ordered` label: an ordered message waits for every older unfinished message in its group, so delayed or retrying messages are not overtaken
+* Add `OrderedRetryMiddleware`: retries requeue the existing row instead of kicking a new message, so a retry keeps its place in an `ordered` group
+* Honour a per-message `max_retries` label in the sweeper, so it and the retry middleware share one attempt budget
 * Add message TTL support for automatic cleanup of completed messages
 * Add automatic sweeping of stuck messages back to queue
 * Add connection health checks and automatic reconnection
@@ -17,6 +19,8 @@
 
 ### Breaking Changes
 
+* Require `taskiq>=0.11.20` for `SmartRetryMiddleware`, which `OrderedRetryMiddleware` extends
+* Stamp `_tpg_row_id` and `_tpg_attempts` labels onto every delivered message
 * Count attempts at claim time: `retry_count` is bumped when a message is claimed rather than when the sweeper reclaims it, so worker crashes and task failures share one budget and `max_retry_attempts` bounds attempts rather than retries
 
 ### Bug Fixes

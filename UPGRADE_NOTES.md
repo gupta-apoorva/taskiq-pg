@@ -27,6 +27,25 @@ sweeper reclaims it. One counter covers every reason an attempt ended, and
 `max_retry_attempts` bounds attempts rather than retries — a limit of 5 allows 5
 executions, and a message that succeeds first time ends at 1.
 
+### Retry Middleware
+
+`OrderedRetryMiddleware` replaces taskiq's `SmartRetryMiddleware`: it subclasses it and
+overrides `on_error` to requeue the existing row, so both hooking the same event would
+retry twice. Requires `taskiq>=0.11.20`. The sweeper now reads the per-message
+`max_retries` label, falling back to `max_retry_attempts`; `-1` means retry forever.
+
+Migrating an existing `SmartRetryMiddleware` setup is not a drop-in swap. The cap comes
+from the `max_retries` label or the broker's `max_retry_attempts`, never from
+`default_retry_count` — the constructor still accepts it, but it does not control the
+budget, because the sweeper has to cap a crashed attempt without any middleware in the
+loop. Move `default_retry_count=N` to `max_retry_attempts=N` on the broker, or set
+`max_retries` per task. `delay`, jitter and the exponent options carry over unchanged.
+
+### Injected Labels
+
+Delivered messages carry `_tpg_row_id` and `_tpg_attempts`, stamped at claim time. They
+are added to the delivered copy, not to the stored body, and are reserved for the broker.
+
 ### Retired Index
 
 `idx_<table>_status_scheduled` is dropped at startup. `idx_<table>_scheduled_id`

@@ -1,11 +1,11 @@
 import asyncio
 import json
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
 import pytest
-from taskiq import AckableMessage, BrokerMessage
+from taskiq import AckableMessage, BrokerMessage, TaskiqMessage
 from taskiq.utils import maybe_awaitable
 
 from taskiq_pg import AsyncpgBroker
@@ -13,6 +13,24 @@ from taskiq_pg.broker_queries import (
     COMPLETE_MESSAGE_QUERY,
     HEARTBEAT_MESSAGES_QUERY,
 )
+from taskiq_pg.labels import ATTEMPTS_LABEL, ROW_ID_LABEL
+
+
+def make_message(
+    broker: AsyncpgBroker,
+    task_name: str = "test_task",
+    labels: Optional[dict[str, Any]] = None,
+) -> BrokerMessage:
+    """Build a kickable message with a real taskiq body."""
+    return broker.formatter.dumps(
+        TaskiqMessage(
+            task_id=uuid.uuid4().hex,
+            task_name=task_name,
+            labels=labels or {},
+            args=[],
+            kwargs={},
+        )
+    )
 
 
 async def get_first_task(asyncpg_broker: AsyncpgBroker) -> AckableMessage:
@@ -36,30 +54,17 @@ async def test_kick_success(asyncpg_broker: AsyncpgBroker) -> None:
     We kick the message, listen to the queue, and check that
     the received message matches what was sent.
     """
-    # Create a unique task ID and name
-    task_id = uuid.uuid4().hex
-    task_name = uuid.uuid4().hex
-
-    # Construct the message
-    sent = BrokerMessage(
-        task_id=task_id,
-        task_name=task_name,
-        message=b"my_msg",
-        labels={
-            "label1": "val1",
-        },
-    )
-
-    # Send the message
+    sent = make_message(asyncpg_broker, labels={"label1": "val1"})
     await asyncpg_broker.kick(sent)
 
-    # Listen for the message
     message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
 
-    # Check that the received message matches the sent message
-    assert message.data == sent.message
+    # Delivery stamps its own labels on, so compare the payload, not the bytes.
+    received = asyncpg_broker.formatter.loads(message.data)
+    assert received.task_id == sent.task_id
+    assert received.task_name == sent.task_name
+    assert received.labels["label1"] == "val1"
 
-    # Acknowledge the message
     await maybe_awaitable(message.ack())
 
 
@@ -103,12 +108,10 @@ async def test_listen(asyncpg_broker: AsyncpgBroker) -> None:
     Test that the broker can listen to messages inserted directly into the database
     and notified via the channel.
     """
+    sent = make_message(asyncpg_broker, labels={"label1": "label_val"})
+
     # Insert a message directly into the database
     conn = await asyncpg.connect(dsn=asyncpg_broker.dsn)
-    message_content = b"test_message"
-    task_id = uuid.uuid4().hex
-    task_name = "test_task"
-    labels = {"label1": "label_val"}
     # For test, insert directly with NOW() for scheduled_at
     result = await conn.fetchrow(
         f"""
@@ -117,10 +120,10 @@ async def test_listen(asyncpg_broker: AsyncpgBroker) -> None:
         VALUES ($1, $2, $3, $4, $5, $6, NOW())
         RETURNING id, lock_key
         """,
-        task_id,
-        task_name,
-        message_content.decode(),
-        json.dumps(labels),
+        sent.task_id,
+        sent.task_name,
+        sent.message.decode(),
+        json.dumps(sent.labels),
         None,  # group_key
         None,  # expire_at
     )
@@ -132,24 +135,24 @@ async def test_listen(asyncpg_broker: AsyncpgBroker) -> None:
 
     # Listen for the message
     message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
-    assert message.data == message_content
+    assert asyncpg_broker.formatter.loads(message.data).task_id == sent.task_id
 
     # Acknowledge the message
     await maybe_awaitable(message.ack())
 
 
 @pytest.mark.anyio
-async def test_wrong_format(asyncpg_broker: AsyncpgBroker) -> None:
-    """Test that messages with incorrect formats are still received."""
-    # Insert a message with missing task_id and task_name
+async def test_unparseable_message_is_not_delivered(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A body the formatter cannot parse is never handed out."""
     conn = await asyncpg.connect(dsn=asyncpg_broker.dsn)
-    # For test, insert directly with NOW() for scheduled_at
     result = await conn.fetchrow(
         f"""
         INSERT INTO {asyncpg_broker.table_name}
         (task_id, task_name, message, labels, group_key, expire_at, scheduled_at)
         VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING id, lock_key
+        RETURNING id
         """,
         "",  # Missing task_id
         "",  # Missing task_name
@@ -159,33 +162,24 @@ async def test_wrong_format(asyncpg_broker: AsyncpgBroker) -> None:
         None,  # expire_at
     )
     assert result is not None
-    message_id = result["id"]
-    # Send a NOTIFY with the message ID
-    await conn.execute(f"NOTIFY {asyncpg_broker.channel_name}, '{message_id}'")
+    await conn.execute(f"NOTIFY {asyncpg_broker.channel_name}, '{result['id']}'")
+
+    with pytest.raises(asyncio.TimeoutError):
+        _ = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+
+    status = await conn.fetchval(
+        f"SELECT status FROM {asyncpg_broker.table_name} WHERE id = $1",  # noqa: S608
+        result["id"],
+    )
     await conn.close()
-
-    # Listen for the message
-    message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
-    assert message.data == b"wrong"  # noqa: PLR2004
-
-    # Acknowledge the message
-    await maybe_awaitable(message.ack())
+    assert status == "active"  # claimed, undeliverable, left for the sweeper
 
 
 @pytest.mark.anyio
 async def test_delayed_message(asyncpg_broker: AsyncpgBroker) -> None:
     """Test that delayed messages are delivered correctly after the specified delay."""
     # Send a message with a delay
-    task_id = uuid.uuid4().hex
-    task_name = "test_task"
-    sent = BrokerMessage(
-        task_id=task_id,
-        task_name=task_name,
-        message=b"delayed_message",
-        labels={
-            "delay": "2",  # Delay in seconds
-        },
-    )
+    sent = make_message(asyncpg_broker, labels={"delay": "2"})
     await asyncpg_broker.kick(sent)
 
     # The message will be inserted immediately but notification will be delayed
@@ -198,7 +192,7 @@ async def test_delayed_message(asyncpg_broker: AsyncpgBroker) -> None:
 
     # Check that it took at least 1.5 seconds (allowing some margin)
     assert elapsed >= 1.5, f"Message arrived too quickly: {elapsed}s"
-    assert message.data == sent.message
+    assert asyncpg_broker.formatter.loads(message.data).task_id == sent.task_id
 
     # Acknowledge the message
     await maybe_awaitable(message.ack())
@@ -210,19 +204,8 @@ async def test_group_key_coordination(asyncpg_broker: AsyncpgBroker) -> None:
     # Send two messages with the same group_key
     group_key = "test_group_123"
 
-    sent1 = BrokerMessage(
-        task_id=uuid.uuid4().hex,
-        task_name="test_task_1",
-        message=b"message_1",
-        labels={"group_key": group_key},
-    )
-
-    sent2 = BrokerMessage(
-        task_id=uuid.uuid4().hex,
-        task_name="test_task_2",
-        message=b"message_2",
-        labels={"group_key": group_key},
-    )
+    sent1 = make_message(asyncpg_broker, "test_task_1", {"group_key": group_key})
+    sent2 = make_message(asyncpg_broker, "test_task_2", {"group_key": group_key})
 
     await asyncpg_broker.kick(sent1)
     await asyncpg_broker.kick(sent2)
@@ -260,13 +243,7 @@ async def test_group_key_coordination(asyncpg_broker: AsyncpgBroker) -> None:
 async def test_message_ttl(asyncpg_broker: AsyncpgBroker) -> None:
     """Test that messages respect TTL settings."""
     # Send a message with a short TTL
-    sent = BrokerMessage(
-        task_id=uuid.uuid4().hex,
-        task_name="test_task",
-        message=b"ttl_message",
-        labels={"ttl": 2},  # 2 seconds TTL
-    )
-
+    sent = make_message(asyncpg_broker, labels={"ttl": 2})
     await asyncpg_broker.kick(sent)
 
     # Receive and acknowledge the message
@@ -290,12 +267,7 @@ async def test_message_ttl(asyncpg_broker: AsyncpgBroker) -> None:
 async def test_dequeue_stamps_heartbeat(asyncpg_broker: AsyncpgBroker) -> None:
     """A claim sets status=active, stamps heartbeat_at and counts the attempt."""
     tbl = asyncpg_broker.table_name
-    sent = BrokerMessage(
-        task_id=uuid.uuid4().hex,
-        task_name="test_task",
-        message=b"hb",
-        labels={},
-    )
+    sent = make_message(asyncpg_broker)
     await asyncpg_broker.kick(sent)
     message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
 
@@ -315,6 +287,69 @@ async def test_dequeue_stamps_heartbeat(asyncpg_broker: AsyncpgBroker) -> None:
         sent.task_id,
     )
     assert after == 1  # acking is not an attempt
+
+
+@pytest.mark.anyio
+async def test_delivery_carries_row_id_and_attempts(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """The middleware learns which row it holds, and how many attempts it has had."""
+    await asyncpg_broker.kick(make_message(asyncpg_broker))
+    message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+
+    labels = asyncpg_broker.formatter.loads(message.data).labels
+    assert asyncpg_broker.write_pool is not None
+    row_id = await asyncpg_broker.write_pool.fetchval(
+        f"SELECT id FROM {asyncpg_broker.table_name}"  # noqa: S608
+    )
+    assert labels[ROW_ID_LABEL] == row_id
+    assert labels[ATTEMPTS_LABEL] == 1
+
+    await maybe_awaitable(message.ack())
+
+
+@pytest.mark.anyio
+async def test_retry_in_place_keeps_the_row(asyncpg_broker: AsyncpgBroker) -> None:
+    """A requeued delivery keeps its id and comes back due after the delay."""
+    tbl = asyncpg_broker.table_name
+    await asyncpg_broker.kick(make_message(asyncpg_broker))
+    claimed = await asyncpg_broker._dequeue_message()
+    assert claimed is not None
+
+    assert await asyncpg_broker.retry_in_place(int(claimed["id"]), 1, 30.0)
+
+    assert asyncpg_broker.write_pool is not None
+    row = await asyncpg_broker.write_pool.fetchrow(
+        f"SELECT id, status, retry_count, heartbeat_at, scheduled_at > NOW() AS later "  # noqa: S608
+        f"FROM {tbl}"
+    )
+    assert row is not None
+    assert row["id"] == claimed["id"]
+    assert row["status"] == "queued"
+    assert row["retry_count"] == 1  # the next claim counts the next attempt
+    assert row["heartbeat_at"] is None
+    assert row["later"] is True
+    assert int(claimed["id"]) not in asyncpg_broker._inflight_ids
+
+
+@pytest.mark.anyio
+async def test_release_is_fenced_on_attempts(asyncpg_broker: AsyncpgBroker) -> None:
+    """A worker whose row was handed to someone else can neither requeue nor kill it."""
+    await asyncpg_broker.kick(make_message(asyncpg_broker))
+    claimed = await asyncpg_broker._dequeue_message()
+    assert claimed is not None
+    row_id = int(claimed["id"])
+    stale = int(claimed["retry_count"]) - 1
+
+    assert not await asyncpg_broker.retry_in_place(row_id, stale, 0.0)
+    assert not await asyncpg_broker.mark_dead(row_id, stale)
+
+    assert asyncpg_broker.write_pool is not None
+    status = await asyncpg_broker.write_pool.fetchval(
+        f"SELECT status FROM {asyncpg_broker.table_name} WHERE id = $1",  # noqa: S608
+        row_id,
+    )
+    assert status == "active"
 
 
 async def _insert_active(
@@ -388,12 +423,7 @@ async def test_kick_leaves_expire_at_null_until_ack(
 ) -> None:
     """TTL is applied at completion, not at insert: expire_at is NULL while queued."""
     tbl = asyncpg_broker.table_name
-    sent = BrokerMessage(
-        task_id=uuid.uuid4().hex,
-        task_name="t",
-        message=b"x",
-        labels={"ttl": 5},
-    )
+    sent = make_message(asyncpg_broker, "t", {"ttl": 5})
     await asyncpg_broker.kick(sent)
 
     conn = await asyncpg.connect(asyncpg_broker.dsn)
@@ -518,6 +548,54 @@ async def test_sweep_dead_letters_at_max_retry_attempts(
     assert row["retry_count"] == 2
 
 
+async def _sweep_with_cap(
+    asyncpg_broker: AsyncpgBroker, cap: Any, attempts: int
+) -> str:
+    """Strand a row on `attempts` deliveries under a `max_retries` label; sweep it."""
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    assert asyncpg_broker.write_pool is not None
+    await asyncpg_broker.kick(make_message(asyncpg_broker, labels={"max_retries": cap}))
+    _ = await asyncpg_broker.write_pool.execute(
+        f"UPDATE {tbl} SET status = 'active', retry_count = $1, "  # noqa: S608
+        "heartbeat_at = NOW() - INTERVAL '10 seconds'",
+        attempts,
+    )
+
+    await asyncpg_broker._sweep_stuck_messages()
+
+    return str(await asyncpg_broker.write_pool.fetchval(f"SELECT status FROM {tbl}"))  # noqa: S608
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("cap", "default", "attempts", "expected"),
+    [
+        (2, 10, 2, "dead"),  # the label overrules a laxer default
+        (-1, 1, 99, "queued"),  # forever: no attempt count exhausts it
+        (None, 5, 5, "dead"),  # absent: the broker's cap applies
+    ],
+)
+async def test_sweep_caps_attempts_by_label(
+    asyncpg_broker: AsyncpgBroker, cap: Any, default: int, attempts: int, expected: str
+) -> None:
+    """`max_retries` wins over the broker default when the label is set."""
+    asyncpg_broker.max_retry_attempts = default
+    assert await _sweep_with_cap(asyncpg_broker, cap, attempts) == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cap", ["many", True, 1.5, "9" * 10, -(2**31) - 1])
+async def test_max_retries_label_validation(
+    asyncpg_broker: AsyncpgBroker, cap: Any
+) -> None:
+    """The sweeper casts the label to INTEGER, so a bad one fails at enqueue."""
+    with pytest.raises(ValueError):
+        await asyncpg_broker.kick(
+            make_message(asyncpg_broker, labels={"max_retries": cap})
+        )
+
+
 @pytest.mark.anyio
 async def test_dead_row_not_dequeued(asyncpg_broker: AsyncpgBroker) -> None:
     """Dead-lettered rows are terminal: dequeue must skip them."""
@@ -616,7 +694,10 @@ async def test_dead_worker_reclaim_and_reprocess(
 
     assert asyncpg_broker.write_pool is not None
     _ = await asyncpg_broker.write_pool.execute(
-        COMPLETE_MESSAGE_QUERY.format(table_name=tbl), asyncpg_broker.message_ttl, mid
+        COMPLETE_MESSAGE_QUERY.format(table_name=tbl),
+        asyncpg_broker.message_ttl,
+        mid,
+        second["retry_count"],
     )
     final = await conn.fetchval(
         f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
@@ -728,6 +809,7 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
             COMPLETE_MESSAGE_QUERY.format(table_name=tbl),
             asyncpg_broker.message_ttl,
             row_a["id"],
+            row_a["retry_count"],
         )
         async with conn_b.transaction():
             row_b3 = await asyncpg_broker._claim_on(conn_b)
@@ -795,7 +877,7 @@ async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> 
                 claimed.append(int(row["id"]))
                 await asyncio.sleep(0)  # force a scheduling point while "active"
                 active_now -= 1
-                await conn.execute(complete_sql, ttl, row["id"])
+                await conn.execute(complete_sql, ttl, row["id"], row["retry_count"])
         finally:
             await conn.close()
 
@@ -837,13 +919,14 @@ async def _kick(broker: AsyncpgBroker, name: str, group_key: Optional[str]) -> N
     )
 
 
-async def _complete(broker: AsyncpgBroker, row_id: int) -> None:
+async def _complete(broker: AsyncpgBroker, row_id: int, attempts: int = 1) -> None:
     """Ack a claimed row so its group frees up."""
     assert broker.write_pool is not None
     _ = await broker.write_pool.execute(
         COMPLETE_MESSAGE_QUERY.format(table_name=broker.table_name),
         broker.message_ttl,
         row_id,
+        attempts,
     )
 
 
@@ -950,7 +1033,7 @@ async def test_ordered_group_does_not_block_other_groups(
     claimed = set()
     while (row := await asyncpg_broker._dequeue_message()) is not None:
         claimed.add(str(row["task_name"]))
-        await _complete(asyncpg_broker, int(row["id"]))
+        await _complete(asyncpg_broker, int(row["id"]), int(row["retry_count"]))
 
     assert claimed == {"runnable", "ungrouped"}
 
@@ -1038,7 +1121,7 @@ async def test_dead_row_halts_only_its_own_group(
     claimed = set()
     while (row := await asyncpg_broker._dequeue_message()) is not None:
         claimed.add(str(row["task_name"]))
-        await _complete(asyncpg_broker, int(row["id"]))
+        await _complete(asyncpg_broker, int(row["id"]), int(row["retry_count"]))
     assert claimed == {"runnable"}
 
 

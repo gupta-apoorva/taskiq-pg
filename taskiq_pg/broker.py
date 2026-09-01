@@ -22,9 +22,12 @@ from taskiq_pg.broker_queries import (
     COMPLETE_MESSAGE_QUERY,
     HEARTBEAT_MESSAGES_QUERY,
     INSERT_MESSAGE_QUERY,
+    MARK_DEAD_QUERY,
+    RETRY_IN_PLACE_QUERY,
     SELECT_MESSAGE_QUERY,
     SWEEP_MESSAGES_QUERY,
 )
+from taskiq_pg.labels import ATTEMPTS_LABEL, ROW_ID_LABEL
 from taskiq_pg.status import MessageStatus
 
 _T = TypeVar("_T")
@@ -231,6 +234,12 @@ class AsyncpgBroker(AsyncBroker):
             ordered = self._resolve_ordered(message.labels)
             if ordered and group_key is None:
                 raise ValueError("`ordered` label requires a `group_key`")
+            # The sweeper casts this straight to INTEGER; reject it here instead.
+            cap = message.labels.get("max_retries")
+            if cap is not None and (
+                isinstance(cap, (bool, float)) or abs(int(cap)) > 2**31 - 1
+            ):
+                raise ValueError(f"`max_retries` label must be an int, got {cap!r}")
             delay_value = message.labels.get("delay")
 
             if delay_value is not None:
@@ -298,6 +307,7 @@ class AsyncpgBroker(AsyncBroker):
                     continue
 
                 message_id = message_row["id"]
+                attempts = message_row["retry_count"]
                 # Per-message ttl label overrides broker default at completion.
                 resolved_ttl = self._resolve_ttl(message_row["labels"])
                 if resolved_ttl < 0:
@@ -310,12 +320,17 @@ class AsyncpgBroker(AsyncBroker):
                 if not isinstance(message_str, str):
                     msg = "message is not a string"
                     raise ValueError(msg)
-                message_data = message_str.encode()
+                message_data = self._inject_delivery_meta(
+                    message_str, message_id, attempts
+                )
 
                 self._inflight_ids.add(message_id)
 
                 async def ack(
-                    *, _message_id: int = message_id, _ttl: int = resolved_ttl
+                    *,
+                    _message_id: int = message_id,
+                    _ttl: int = resolved_ttl,
+                    _attempts: int = attempts,
                 ) -> None:
                     if self.write_pool is None:
                         raise ValueError("Call startup before starting listening.")
@@ -327,6 +342,7 @@ class AsyncpgBroker(AsyncBroker):
                             COMPLETE_MESSAGE_QUERY.format(table_name=self.table_name),
                             _ttl,
                             _message_id,
+                            _attempts,
                         )
                     self._inflight_ids.discard(_message_id)
 
@@ -334,6 +350,40 @@ class AsyncpgBroker(AsyncBroker):
             except Exception as e:
                 logger.exception(f"Error processing message: {e}")
                 continue
+
+    def _inject_delivery_meta(self, raw: str, row_id: int, attempts: int) -> bytes:
+        """Stamp row id and attempt count onto the message about to be delivered.
+
+        Retry-in-place redelivers the stored body untouched, so the count cannot live
+        in it.
+        """
+        message = self.formatter.loads(raw.encode())
+        message.labels[ROW_ID_LABEL] = row_id
+        message.labels[ATTEMPTS_LABEL] = attempts
+        return self.formatter.dumps(message).message
+
+    async def retry_in_place(self, row_id: int, attempts: int, delay: float) -> bool:
+        """Hand a delivery back to the queue, keeping its id and its place in a group.
+
+        `attempts` is what the caller was given at claim; a mismatch means the row was
+        reclaimed and handed to someone else, and nothing is updated. Returns whether
+        the requeue landed.
+        """
+        return await self._release(RETRY_IN_PLACE_QUERY, row_id, attempts, delay)
+
+    async def mark_dead(self, row_id: int, attempts: int) -> bool:
+        """Park a delivery in `dead`. Fenced like retry_in_place."""
+        return await self._release(MARK_DEAD_QUERY, row_id, attempts)
+
+    async def _release(self, query: str, row_id: int, *args: Any) -> bool:
+        if self.write_pool is None:
+            raise ValueError("Call startup before releasing a message.")
+        # Discard first: the heartbeat must not refresh a lease we are dropping.
+        self._inflight_ids.discard(row_id)
+        status = await self.write_pool.execute(
+            query.format(table_name=self.table_name), row_id, *args
+        )
+        return status.endswith(" 1")
 
     async def _claim_on(
         self, conn: "asyncpg.Connection[asyncpg.Record]"

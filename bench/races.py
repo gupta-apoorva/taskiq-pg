@@ -1,16 +1,18 @@
 # ruff: noqa: T201, S608, S101
 """Race drills. Probabilistic by construction -- not tests, do not put in the suite.
 
-Both failures need one worker to commit mid-statement of another's dequeue; that
+Each failure needs one worker to commit mid-statement of another's dequeue; that
 interleaving cannot be driven by hand, so these hammer until it happens and report a
-hit rate. A clean run proves nothing on its own.
+hit rate. A clean run proves nothing on its own -- `ordered` ships its own control.
 
   mutex      -- two rows of one group 'active' at once. Checks committed state on
                 every claim, not a sampled counter.
   orphan     -- a row marked 'active' that no consumer received. Needs inserts to
                 land while claims are in flight, so it produces and consumes at once.
+  ordered    -- an ordered group completing out of id order while its members retry
+                in place. A retry that loses its slot shows up as an inversion.
 
-Usage: uv run python -m bench.races [mutex|orphan|all] [rounds]
+Usage: uv run python -m bench.races [mutex|orphan|ordered|all] [rounds]
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import random
 import string
 import sys
 import uuid
+from collections import defaultdict
 
 import asyncpg
 from taskiq import BrokerMessage
@@ -96,7 +99,9 @@ async def mutex_drill(groups: int = 2, backlog: int = 800, workers: int = 8) -> 
                     if int(active) > 1:
                         violations.append((str(row["group_key"]), int(active)))
                     await asyncio.sleep(0.005)
-                    await conn.execute(complete_sql, broker.message_ttl, row["id"])
+                    await conn.execute(
+                        complete_sql, broker.message_ttl, row["id"], row["retry_count"]
+                    )
             finally:
                 await conn.close()
 
@@ -104,6 +109,87 @@ async def mutex_drill(groups: int = 2, backlog: int = 800, workers: int = 8) -> 
         assert len(claimed) == backlog, f"lost rows: {len(claimed)} of {backlog}"
         assert len(set(claimed)) == backlog, "a row was claimed twice"
         return len(violations)
+    finally:
+        await _drop(broker)
+
+
+async def ordered_drill(
+    groups: int = 4,
+    backlog: int = 400,
+    workers: int = 8,
+    fail_rate: float = 0.4,
+    ordered: bool = True,
+) -> int:
+    """Retries requeue in place while rivals claim. Returns out-of-order completions.
+
+    ordered=False is the control: without the label a retry may be overtaken, so a
+    run that reports nothing there means the drill is not exercising the path.
+    """
+    broker = await _broker()
+    table = broker.table_name
+    try:
+        for i in range(backlog):
+            await broker.kick(
+                BrokerMessage(
+                    task_id=uuid.uuid4().hex,
+                    task_name="t",
+                    message=b"x",
+                    labels={"group_key": f"g{i % groups}", "ordered": ordered},
+                )
+            )
+        complete_sql = COMPLETE_MESSAGE_QUERY.format(table_name=table)
+        done: dict[str, list[int]] = defaultdict(list)
+        concurrent: list[tuple[str, int]] = []
+
+        async def worker() -> None:
+            conn = await asyncpg.connect(DSN)
+            try:
+                while True:
+                    async with conn.transaction():
+                        row = await broker._claim_on(conn)
+                    if row is None:
+                        left = await conn.fetchval(
+                            f"SELECT COUNT(*) FROM {table} WHERE status <> 'completed'"
+                        )
+                        if left == 0:
+                            return
+                        await asyncio.sleep(0.005)
+                        continue
+                    # A retry must not open the group to a sibling while we hold it.
+                    active = await conn.fetchval(
+                        f"SELECT COUNT(*) FROM {table} "
+                        "WHERE group_key = $1 AND status = 'active'",
+                        row["group_key"],
+                    )
+                    if int(active) > 1:
+                        concurrent.append((str(row["group_key"]), int(active)))
+                    # Attempt 3 always succeeds: a dead row would halt its group.
+                    if int(row["retry_count"]) < 3 and random.random() < fail_rate:
+                        await broker.retry_in_place(
+                            int(row["id"]), int(row["retry_count"]), 0.0
+                        )
+                        continue
+                    done[str(row["group_key"])].append(int(row["id"]))
+                    await conn.execute(
+                        complete_sql, broker.message_ttl, row["id"], row["retry_count"]
+                    )
+            finally:
+                await conn.close()
+
+        await asyncio.wait_for(
+            asyncio.gather(*(worker() for _ in range(workers))), timeout=180
+        )
+        drained = sum(len(ids) for ids in done.values())
+        assert drained == backlog, f"lost rows: {drained} of {backlog}"
+        inversions = sum(
+            1
+            for ids in done.values()
+            for earlier, later in zip(ids, ids[1:])
+            if later < earlier
+        )
+        if inversions or concurrent:
+            print(f"    inversions={inversions} concurrent={concurrent[:5]}")
+        return inversions + len(concurrent)
     finally:
         await _drop(broker)
 
@@ -152,7 +238,9 @@ async def orphan_drill(
                         continue
                     idle = 0
                     delivered.append(int(row["id"]))
-                    await conn.execute(complete_sql, broker.message_ttl, row["id"])
+                    await conn.execute(
+                        complete_sql, broker.message_ttl, row["id"], row["retry_count"]
+                    )
             finally:
                 await conn.close()
 
@@ -173,7 +261,7 @@ async def orphan_drill(
 async def main() -> int:
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    drills = {"mutex": mutex_drill, "orphan": orphan_drill}
+    drills = {"mutex": mutex_drill, "orphan": orphan_drill, "ordered": ordered_drill}
     if which != "all":
         drills = {which: drills[which]}
 

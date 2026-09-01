@@ -176,6 +176,36 @@ A dead-lettered message halts its group: nothing behind it is claimed until it i
 
 Each group must be enqueued by a single producer. `id` comes from a sequence and is assigned before the transaction commits, so two producers writing the same group at once can commit ids out of order: the higher id becomes visible first and is claimed, and the lower id then arrives with nothing older left to wait for.
 
+### Retries in Place
+
+`OrderedRetryMiddleware` retries by requeueing the existing row instead of kicking a new
+message, which would get a higher `id` and land behind its own group:
+
+```python
+from taskiq_pg import AsyncpgBroker, OrderedRetryMiddleware
+
+broker = AsyncpgBroker(dsn).with_middlewares(OrderedRetryMiddleware(default_delay=5))
+
+@broker.task(retry_on_error=True, max_retries=-1, group_key="user_123", ordered=True)
+async def relay() -> None: ...
+```
+
+It subclasses `SmartRetryMiddleware` and takes the same labels and delay options, but
+**it is not a drop-in replacement** — read the migration note in `UPGRADE_NOTES.md`
+before swapping. In short: `default_retry_count` is inherited but does not set the cap.
+The budget is the `max_retries` label, or the broker's `max_retry_attempts` without one,
+because the sweeper has to cap a crashed attempt with no middleware in the loop. Both
+read the same two numbers, so a message ends the same way whether it failed or crashed.
+
+Use it instead of, not alongside, `SmartRetryMiddleware`. It needs `AsyncpgBroker` and
+raises on any other. `max_retries` must be an int and is rejected at `kick` otherwise;
+`-1` retries forever. Attempts come from the row, so a message that runs out is marked
+dead.
+
+Keep the worker's ack type at `when_saved` (the default) or `when_executed`. Retrying
+needs the row still held; `when_received` acks it before the task runs, and retries stop
+working.
+
 ### Message TTL
 Control how long completed messages are retained:
 

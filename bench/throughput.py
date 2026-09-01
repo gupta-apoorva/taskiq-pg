@@ -13,6 +13,9 @@ rebuilds an identical broker:
 * ``BENCH_CHANNEL``       - LISTEN/NOTIFY channel (default: ``<table>_ch``)
 * ``BENCH_BUSY_SECONDS``  - CPU busy-loop seconds for CPU-bound tasks (default: 0.005)
 * ``BENCH_SLEEP_SECONDS`` - asyncio.sleep seconds for I/O-bound tasks (default: 0.005)
+* ``BENCH_FAIL_RATE``     - per-attempt failure probability (default: 0, no retries)
+* ``BENCH_MAX_RETRIES``   - attempt budget per message (default: 3)
+* ``BENCH_RETRY_DELAY``   - backoff seconds on retry (default: 0)
 
 This broker claims each message atomically (``FOR UPDATE SKIP LOCKED``), so a
 task is executed exactly once regardless of ``--workers``. Use ``--workers > 1``
@@ -22,6 +25,11 @@ to measure concurrent drain across competing worker processes.
 concurrency at N (one active message per group). Adding ``--ordered`` also
 enforces FIFO within each group; compare the two at the same ``--groups`` to
 price the head-of-line predicate.
+
+``--fail-rate P`` makes each attempt fail with probability P and attaches
+``OrderedRetryMiddleware``, so failures requeue the same row instead of kicking a
+new one. Compare against ``--fail-rate 0`` at the same ``-n`` to price retries;
+the report separates messages drained from attempts executed.
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ import sys
 import time
 
 from taskiq_pg.broker import AsyncpgBroker
+from taskiq_pg.middlewares import OrderedRetryMiddleware
 
 DSN = os.environ.setdefault(
     "BENCH_DSN",
@@ -49,6 +58,9 @@ TABLE = os.environ.setdefault(
 CHANNEL = os.environ.setdefault("BENCH_CHANNEL", f"{TABLE}_ch")
 BUSY_SECONDS = float(os.environ.setdefault("BENCH_BUSY_SECONDS", "0.005"))
 SLEEP_SECONDS = float(os.environ.setdefault("BENCH_SLEEP_SECONDS", "0.005"))
+FAIL_RATE = float(os.environ.setdefault("BENCH_FAIL_RATE", "0"))
+MAX_RETRIES = int(os.environ.setdefault("BENCH_MAX_RETRIES", "3"))
+RETRY_DELAY = float(os.environ.setdefault("BENCH_RETRY_DELAY", "0"))
 
 broker = AsyncpgBroker(
     dsn=DSN,
@@ -58,10 +70,20 @@ broker = AsyncpgBroker(
     pool_kwargs={"server_settings": {"application_name": "bench_worker"}},
 )
 
+if FAIL_RATE:
+    broker = broker.with_middlewares(
+        OrderedRetryMiddleware(
+            default_retry_count=MAX_RETRIES, default_delay=RETRY_DELAY
+        )
+    )
 
-@broker.task(task_name="bench_task")
+
+@broker.task(task_name="bench_task", retry_on_error=True, max_retries=MAX_RETRIES)
 async def bench_task() -> int:
     """Mixed workload: ~50% CPU busy-loop, ~50% async sleep."""
+    if FAIL_RATE and random.random() < FAIL_RATE:
+        msg = "bench-induced failure"
+        raise RuntimeError(msg)
     if random.random() < 0.5:
         deadline = time.perf_counter() + BUSY_SECONDS
         total = 0
@@ -82,12 +104,38 @@ def _repo_root() -> str:
 
 
 async def _count_rows() -> int:
-    # Outstanding work = not yet completed. This broker soft-completes (marks
-    # status='completed' for TTL) instead of deleting, so filter those out.
+    # Outstanding work = not yet terminal. This broker soft-completes (marks
+    # status='completed' for TTL) instead of deleting; 'dead' is terminal too.
     value = await broker.write_pool.fetchval(
-        f"SELECT count(*) FROM {TABLE} WHERE status <> 'completed'"
+        f"SELECT count(*) FROM {TABLE} WHERE status NOT IN ('completed', 'dead')"
     )
     return int(value or 0)
+
+
+async def _attempt_stats(after_id: int) -> tuple[int, int]:
+    """Attempts executed and messages that burned their budget, sentinel excluded."""
+    row = await broker.write_pool.fetchrow(
+        f"SELECT coalesce(sum(retry_count), 0) AS attempts, "
+        f"count(*) FILTER (WHERE status = 'dead') AS dead "
+        f"FROM {TABLE} WHERE id > $1",
+        after_id,
+    )
+    return (int(row["attempts"]), int(row["dead"])) if row else (0, 0)
+
+
+async def _stuck_breakdown() -> str:
+    """Why the queue is not draining: state of what is left, and of the oldest row."""
+    # 'dead' included on purpose: one dead row halts its whole ordered group.
+    rows = await broker.write_pool.fetch(
+        f"SELECT status, count(*) AS n, min(scheduled_at - NOW()) AS soonest "
+        f"FROM {TABLE} GROUP BY status"
+    )
+    states = ", ".join(f"{r['status']}={r['n']} (due in {r['soonest']})" for r in rows)
+    head = await broker.write_pool.fetchrow(
+        f"SELECT id, group_key, status, retry_count, ordered FROM {TABLE} "
+        f"WHERE status NOT IN ('completed', 'dead') ORDER BY id LIMIT 1"
+    )
+    return f"{states}; head={dict(head.items()) if head else None}"
 
 
 async def _remaining_ids() -> list[int]:
@@ -136,13 +184,13 @@ async def _spawn_worker(
     )
 
 
-async def _wait_ready(timeout: float) -> bool:
+async def _wait_ready(timeout: float, max_retries: int) -> bool:
     """Drain a single sentinel task to confirm the full path works.
 
     Re-NOTIFYs periodically in case the worker is not LISTENing yet; on this
     broker a missed NOTIFY is lost forever.
     """
-    await bench_task.kiq()
+    await bench_task.kicker().with_labels(max_retries=max_retries).kiq()
     sentinel_id = await broker.write_pool.fetchval(
         f"SELECT id FROM {TABLE} ORDER BY id DESC LIMIT 1"
     )
@@ -160,18 +208,21 @@ async def _wait_ready(timeout: float) -> bool:
     return await _count_rows() == 0
 
 
-async def _kick_many(count: int, concurrency: int, groups: int, ordered: bool) -> float:
+async def _kick_many(
+    count: int, concurrency: int, groups: int, ordered: bool, max_retries: int
+) -> float:
     sem = asyncio.Semaphore(concurrency)
 
     async def one(index: int) -> None:
         async with sem:
+            # Set here, not from the decorator: the driver imported this module
+            # before --max-retries was parsed, so its task labels are stale.
+            kicker = bench_task.kicker().with_labels(max_retries=max_retries)
             if groups:
-                kicker = bench_task.kicker().with_labels(
+                kicker = kicker.with_labels(
                     group_key=f"g{index % groups}", ordered=ordered
                 )
-                await kicker.kiq()
-            else:
-                await bench_task.kiq()
+            await kicker.kiq()
 
     start = time.monotonic()
     await asyncio.gather(*(one(i) for i in range(count)))
@@ -211,10 +262,9 @@ async def _drain(drain_timeout: float, stall_timeout: float) -> float:
             last_progress = now
 
         if now > deadline:
-            ids = await _remaining_ids()
             raise TimeoutError(
-                f"drain timed out with {len(ids)} rows remaining after "
-                f"{drain_timeout:.0f}s"
+                f"drain timed out with {remaining} rows remaining after "
+                f"{drain_timeout:.0f}s; {await _stuck_breakdown()}"
             )
         await asyncio.sleep(0.1)
 
@@ -233,7 +283,9 @@ async def _teardown_worker(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-def _print_report(args: argparse.Namespace, total_elapsed: float) -> None:
+def _print_report(
+    args: argparse.Namespace, total_elapsed: float, attempts: int, dead: int
+) -> None:
     if args.groups:
         mode = f"{args.groups} groups, {'ordered' if args.ordered else 'mutex only'}"
     else:
@@ -243,12 +295,26 @@ def _print_report(args: argparse.Namespace, total_elapsed: float) -> None:
     print(f"workers              : {args.workers}")
     print(f"max_async_tasks      : {args.max_async_tasks}")
     print(f"mode                 : {mode}")
+    if args.fail_rate:
+        print(
+            f"fail rate            : {args.fail_rate} "
+            f"(max_retries {args.max_retries}, delay {args.retry_delay}s)"
+        )
     print(f"table                : {TABLE}")
     print("-")
     print(
         f"end-to-end           : {total_elapsed:8.3f}s  "
         f"({args.count / total_elapsed:10.1f} tasks/s)"
     )
+    if args.fail_rate:
+        print(
+            f"attempts executed    : {attempts:8d}  "
+            f"({attempts / total_elapsed:10.1f} attempts/s)"
+        )
+        print(
+            f"retries              : {attempts - args.count:8d}  "
+            f"({dead} dead-lettered)"
+        )
     if args.groups:
         print(
             f"\nNOTE: --groups {args.groups} caps concurrency at {args.groups} "
@@ -264,6 +330,9 @@ def _print_report(args: argparse.Namespace, total_elapsed: float) -> None:
 async def _run(args: argparse.Namespace) -> int:
     os.environ["BENCH_BUSY_SECONDS"] = str(args.busy_seconds)
     os.environ["BENCH_SLEEP_SECONDS"] = str(args.sleep_seconds)
+    os.environ["BENCH_FAIL_RATE"] = str(args.fail_rate)
+    os.environ["BENCH_MAX_RETRIES"] = str(args.max_retries)
+    os.environ["BENCH_RETRY_DELAY"] = str(args.retry_delay)
 
     await broker.startup()
     # The driver only enqueues + polls, so drop its listener.
@@ -276,17 +345,30 @@ async def _run(args: argparse.Namespace) -> int:
             args.workers, args.max_async_tasks, args.worker_output
         )
         print(f"spawned worker (pid={proc.pid}); waiting for readiness...")
-        if not await _wait_ready(args.ready_timeout):
+        if not await _wait_ready(args.ready_timeout, args.max_retries):
             print("worker did not become ready in time", file=sys.stderr)
             return 1
         print("worker ready; enqueuing tasks...")
 
+        # Everything up to here is readiness traffic; stats count only what follows.
+        last_setup_id = int(
+            await broker.write_pool.fetchval(
+                f"SELECT coalesce(max(id), 0) FROM {TABLE}"
+            )
+        )
         kick_start = time.monotonic()
-        await _kick_many(args.count, args.kick_concurrency, args.groups, args.ordered)
+        await _kick_many(
+            args.count,
+            args.kick_concurrency,
+            args.groups,
+            args.ordered,
+            args.max_retries,
+        )
         await _drain(args.drain_timeout, args.stall_timeout)
         total_elapsed = time.monotonic() - kick_start
 
-        _print_report(args, total_elapsed)
+        attempts, dead = await _attempt_stats(last_setup_id)
+        _print_report(args, total_elapsed, attempts, dead)
         return 0
     finally:
         if proc is not None:
@@ -324,6 +406,24 @@ def _parse_args() -> argparse.Namespace:
         "--ordered",
         action="store_true",
         help="FIFO within each group; requires --groups",
+    )
+    parser.add_argument(
+        "--fail-rate",
+        type=float,
+        default=0.0,
+        help="per-attempt failure probability (0 = no retries)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=MAX_RETRIES,
+        help="attempt budget per message",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=RETRY_DELAY,
+        help="backoff seconds on retry",
     )
     args = parser.parse_args()
     if args.ordered and not args.groups:
