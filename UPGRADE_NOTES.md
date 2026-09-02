@@ -10,7 +10,6 @@ The broker now uses an enhanced database schema with additional columns:
 
 - `status`: Tracks message state (queued, active, completed)
 - `scheduled_at`: Controls when messages become available for processing
-- `lock_key`: Vestigial. Retained for rollout compatibility; claiming uses `FOR UPDATE SKIP LOCKED`, not advisory locks
 - `expire_at`: Automatic cleanup timestamp
 - `group_key`: For coordinating related messages
 - `retry_count`: Counts deliveries. Bumped by the claim, so a crashed attempt and a failed one draw on the same budget
@@ -19,6 +18,35 @@ The broker now uses an enhanced database schema with additional columns:
 **Migration Required**: If you have existing messages in your database, you'll need to either:
 1. Drop and recreate the messages table (losing existing messages)
 2. Manually add the new columns with appropriate defaults
+
+### `id` widened to bigint
+
+Every insert takes one `id`, and cleanup deletes completed rows without giving their ids
+back, so the sequence counts lifetime inserts. `SERIAL` capped that at 2 147 483 647,
+which is about 25 days at 1000 messages per second. `nextval` then fails and the queue
+stops accepting work.
+
+`id` is now `BIGSERIAL`, and startup widens an existing `integer` column together with
+its sequence. Both statements below are needed: `ALTER TABLE ... ALTER COLUMN id TYPE
+BIGINT` on its own leaves the sequence capped at the int4 maximum.
+
+The column change rewrites the table and rebuilds the primary key while it holds ACCESS
+EXCLUSIVE, and startup runs it inside the DDL transaction. Every producer and every
+worker waits for it. If your table carries a backlog, run it yourself before you deploy;
+startup then finds `bigint` and skips the block:
+
+```sql
+ALTER TABLE taskiq_messages ALTER COLUMN id TYPE BIGINT;
+ALTER SEQUENCE taskiq_messages_id_seq AS BIGINT;
+```
+
+### `lock_key` dropped
+
+The column held the key for the row-level advisory lock that the claim used before
+`FOR UPDATE SKIP LOCKED`. No released version reads it, so startup drops it, and the drop
+removes the sequence it owned. Inserts no longer call `nextval` on it. Roll back to an
+older version and its own DDL adds the column again at startup, which costs a table
+rewrite, because a `SERIAL` default is volatile.
 
 ### Attempt Counting
 

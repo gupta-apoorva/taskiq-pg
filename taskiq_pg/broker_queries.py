@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from taskiq_pg.status import MessageStatus
 
-# Additive DDL: base table + idempotent ALTERs so a legacy (master) table gains
-# every new column in place before the indexes below reference them.
-# lock_key stays vestigial (old advisory-lock workers still read it during rollout).
+# Idempotent DDL: base table + ALTERs so a legacy (master) table gains every new column
+# before the indexes below reference them, loses lock_key, and widens id.
 CREATE_TABLE_QUERY = f"""
 CREATE TABLE IF NOT EXISTS {{table_name}} (
-    id SERIAL PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
     task_id VARCHAR NOT NULL,
     task_name VARCHAR NOT NULL,
     message TEXT NOT NULL,
@@ -17,7 +16,6 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}' CHECK (status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.COMPLETED.value}', '{MessageStatus.DEAD.value}')),
-    lock_key SERIAL NOT NULL,
     expire_at TIMESTAMP WITH TIME ZONE,
     group_key VARCHAR,
     retry_count INTEGER NOT NULL DEFAULT 0,
@@ -26,13 +24,35 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
 );
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}';
-ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS lock_key SERIAL NOT NULL;
+-- Key of the pre-SKIP-LOCKED claim; no shipped version reads it. Drop takes its owned
+-- sequence too, so inserts stop burning a nextval. Before the widening: one less column.
+ALTER TABLE {{table_name}} DROP COLUMN IF EXISTS lock_key;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIME ZONE;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE;
 -- Opt-in FIFO. Metadata-only on PG11+; existing rows read false, i.e. mutex-only.
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS ordered BOOLEAN NOT NULL DEFAULT FALSE;
+-- int4 ids run out after 2.1B inserts; cleanup gives none back. Sequence type is separate
+-- from column type -- widen both. Guarded: rewrites the table under ACCESS EXCLUSIVE.
+DO $do$
+DECLARE
+    seq text;
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = '{{table_name}}'::regclass
+          AND attname = 'id' AND NOT attisdropped
+          AND atttypid = 'integer'::regtype
+    ) THEN
+        ALTER TABLE {{table_name}} ALTER COLUMN id TYPE BIGINT;
+        seq := pg_get_serial_sequence('{{table_name}}', 'id');
+        IF seq IS NOT NULL THEN
+            EXECUTE format('ALTER SEQUENCE %s AS BIGINT', seq);
+        END IF;
+    END IF;
+END
+$do$;
 -- Legacy tables carry an auto-named CHECK without 'dead'. Only migrate when no
 -- existing check constraint already permits 'dead' — DROP/ADD takes ACCESS EXCLUSIVE
 -- and revalidates every row, so we must not run it on every startup.
@@ -198,7 +218,7 @@ WHERE id = $1
 HEARTBEAT_MESSAGES_QUERY = f"""
 UPDATE {{table_name}}
 SET heartbeat_at = NOW()
-WHERE id = ANY($1::int[]) AND status = '{MessageStatus.ACTIVE.value}'
+WHERE id = ANY($1::bigint[]) AND status = '{MessageStatus.ACTIVE.value}'
 """
 
 # TTL = completed-retention window. $3 is the attempt count the caller was given at
