@@ -54,9 +54,17 @@ rules out a constant default.
 
 Its sequence therefore cycles instead: `nextval` wraps from 2 147 483 647 back to 1
 rather than failing, and two rows collide only if both are in flight 2.1 billion inserts
-apart. Startup sets this, and you can set it ahead of time. It changes metadata only:
+apart. Setting `CYCLE` changes metadata only.
+
+On a table that lost the column, startup also adds it back, with a `SERIAL` default. That
+default is volatile, so the `ADD COLUMN` rewrites the table under ACCESS EXCLUSIVE, the
+same cost as the `id` change and with the same way out: run it yourself first. The
+backfill is the point of it. A nullable add would skip the rewrite and leave every
+existing row at NULL, and an old client interpolates that straight into its lock as
+`pg_try_advisory_lock(1, None)`.
 
 ```sql
+ALTER TABLE taskiq_messages ADD COLUMN IF NOT EXISTS lock_key SERIAL NOT NULL;
 ALTER SEQUENCE taskiq_messages_lock_key_seq CYCLE;
 ```
 
