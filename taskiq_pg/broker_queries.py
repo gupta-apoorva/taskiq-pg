@@ -5,7 +5,7 @@ from __future__ import annotations
 from taskiq_pg.status import MessageStatus
 
 # Idempotent DDL: base table + ALTERs so a legacy (master) table gains every new column
-# before the indexes below reference them, loses lock_key, and widens id.
+# before the indexes below reference them, and widens id.
 CREATE_TABLE_QUERY = f"""
 CREATE TABLE IF NOT EXISTS {{table_name}} (
     id BIGSERIAL PRIMARY KEY,
@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}' CHECK (status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.COMPLETED.value}', '{MessageStatus.DEAD.value}')),
+    lock_key SERIAL NOT NULL,
     expire_at TIMESTAMP WITH TIME ZONE,
     group_key VARCHAR,
     retry_count INTEGER NOT NULL DEFAULT 0,
@@ -24,9 +25,20 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
 );
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}';
--- Key of the pre-SKIP-LOCKED claim; no shipped version reads it. Drop takes its owned
--- sequence too, so inserts stop burning a nextval. Before the widening: one less column.
-ALTER TABLE {{table_name}} DROP COLUMN IF EXISTS lock_key;
+-- Key of the pre-SKIP-LOCKED claim. Old clients still read it and lock with
+-- pg_try_advisory_lock(keyspace, lock_key), the two-int4 form, so it stays int4 and stays
+-- distinct. CYCLE, not widening: nextval wraps at 2.1B instead of failing, and a
+-- collision needs two in-flight rows 2.1B inserts apart.
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS lock_key SERIAL NOT NULL;
+DO $do$
+DECLARE
+    seq text := pg_get_serial_sequence('{{table_name}}', 'lock_key');
+BEGIN
+    IF seq IS NOT NULL THEN
+        EXECUTE format('ALTER SEQUENCE %s CYCLE', seq);
+    END IF;
+END
+$do$;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIME ZONE;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
