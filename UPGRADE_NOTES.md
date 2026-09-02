@@ -27,13 +27,13 @@ which is about 25 days at 1000 messages per second. `nextval` then fails and the
 stops accepting work.
 
 `id` is now `BIGSERIAL`, and startup widens an existing `integer` column together with
-its sequence. Both statements are needed: `ALTER COLUMN id TYPE BIGINT` leaves the
-sequence capped at the int4 maximum.
+its sequence. Both statements below are needed: `ALTER TABLE ... ALTER COLUMN id TYPE
+BIGINT` on its own leaves the sequence capped at the int4 maximum.
 
-`ALTER TABLE ... TYPE BIGINT` rewrites the table and rebuilds the primary key while it
-holds ACCESS EXCLUSIVE, and startup runs it inside the DDL transaction. Every producer
-and every worker waits for it. If your table carries a backlog, run it yourself before
-you deploy; startup then finds `bigint` and skips the block:
+The column change rewrites the table and rebuilds the primary key while it holds ACCESS
+EXCLUSIVE, and startup runs it inside the DDL transaction. Every producer and every
+worker waits for it. If your table carries a backlog, run it yourself before you deploy;
+startup then finds `bigint` and skips the block:
 
 ```sql
 ALTER TABLE taskiq_messages ALTER COLUMN id TYPE BIGINT;

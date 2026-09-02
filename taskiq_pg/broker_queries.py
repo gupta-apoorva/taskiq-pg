@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from taskiq_pg.status import MessageStatus
 
-# Additive DDL: base table + idempotent ALTERs so a legacy (master) table gains
-# every new column in place before the indexes below reference them.
+# Idempotent DDL: base table + ALTERs so a legacy (master) table gains every new column
+# before the indexes below reference them, loses lock_key, and widens id.
 CREATE_TABLE_QUERY = f"""
 CREATE TABLE IF NOT EXISTS {{table_name}} (
     id BIGSERIAL PRIMARY KEY,
