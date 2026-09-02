@@ -8,7 +8,7 @@ This is a fork of [taskiq-psqlpy](https://github.com/taskiq-python/taskiq-psqlpy
 
 ## Installation
 
-To use this project you must have installed core taskiq library:
+This project needs the core taskiq library:
 
 ```bash
 pip install taskiq
@@ -124,7 +124,7 @@ select convert_from(result, 'UTF8') from taskiq_results;
 ## AsyncpgResultBackend configuration
 
 - `dsn`: connection string to PostgreSQL.
-- `keep_results`: flag to not remove results from Redis after reading.
+- `keep_results`: keep a result in the table after it is read instead of deleting it.
 - `table_name`: name of the table in PostgreSQL to store TaskIQ results.
 - `field_for_task_id`: type of a field for `task_id`, you may need it if you want to have length of task_id more than 255 symbols.
 - `**connect_kwargs`: additional connection parameters, you can read more about it in [asyncpg](https://github.com/MagicStack/asyncpg) repository.
@@ -145,19 +145,16 @@ select convert_from(result, 'UTF8') from taskiq_results;
 - `enable_sweeping`: Enable automatic cleanup of stuck messages (default: True).
 - `sweep_interval`: Interval between sweep operations in seconds (default: 60).
 
-## Enhanced Features
+## Features
 
 ### Atomic Message Claiming
-The broker claims each message atomically with `SELECT ... FOR UPDATE SKIP LOCKED`, so competing workers never grab the same row. An in-flight message keeps a heartbeat lease; if a worker dies, the sweeper reclaims the stale lease and re-queues the message.
+The broker claims each message with `SELECT ... FOR UPDATE SKIP LOCKED`, so two workers never take the same row. An in-flight message holds a heartbeat lease, and when a worker dies the sweeper requeues the message its lease was on.
 
 ### Message States
-Messages now have three states:
-- `queued`: Message is waiting to be processed
-- `active`: Message is currently being processed
-- `completed`: Message has been processed and acknowledged
+A message is `queued` while it waits, `active` while it runs, `completed` once it is acknowledged, and `dead` once it has spent its attempts.
 
 ### Group-based Coordination
-You can prevent concurrent execution of related tasks by setting a `group_key` in the message labels:
+Set a `group_key` label to stop related tasks from running at the same time:
 
 ```python
 await my_task.kicker().with_labels(group_key="user_123").kiq()
@@ -170,7 +167,7 @@ Add `ordered=True` to run a group in insertion order as well. An ordered message
 await my_task.kicker().with_labels(group_key="user_123", ordered=True).kiq()
 ```
 
-Order follows the broker's `id`, not `scheduled_at`, so a `delay` label cannot move a message ahead of its group. The label requires a `group_key` and must be a bool. It is opt-in per message: unlabelled messages keep the mutex-only behaviour above. Note that a blocked group correctly looks like a stalled queue, and that workers on older versions of this broker ignore the column — roll the broker out everywhere before setting the label.
+Order follows the broker's `id`, not `scheduled_at`, so a `delay` label cannot move a message ahead of its group. The label requires a `group_key` and must be a bool. It is opt-in per message, and an unlabelled message keeps the mutex-only behaviour above. Two cautions: a blocked group looks exactly like a stalled queue, and a worker on an older version of this broker ignores the column, so roll the broker out everywhere before you set the label.
 
 A dead-lettered message halts its group: nothing behind it is claimed until it is resolved. Skipping it would drop a message out of the ordered stream with no signal. Unordered groups are unaffected and continue past dead rows as before.
 
@@ -191,11 +188,11 @@ async def relay() -> None: ...
 ```
 
 It subclasses `SmartRetryMiddleware` and takes the same labels and delay options, but
-**it is not a drop-in replacement** — read the migration note in `UPGRADE_NOTES.md`
-before swapping. In short: `default_retry_count` is inherited but does not set the cap.
-The budget is the `max_retries` label, or the broker's `max_retry_attempts` without one,
-because the sweeper has to cap a crashed attempt with no middleware in the loop. Both
-read the same two numbers, so a message ends the same way whether it failed or crashed.
+**it is not a drop-in replacement**. Read the migration note in `UPGRADE_NOTES.md` before
+you swap. `default_retry_count` is inherited and does not set the cap. The budget is the
+`max_retries` label, or the broker's `max_retry_attempts` without one, because the sweeper
+has to cap a crashed attempt with no middleware in the loop. Both read the same two
+numbers, so a message ends the same way whether it failed or crashed.
 
 Use it instead of, not alongside, `SmartRetryMiddleware`. It needs `AsyncpgBroker` and
 raises on any other. `max_retries` must be an int and is rejected at `kick` otherwise;
@@ -215,10 +212,8 @@ await my_task.kicker().with_labels(ttl=3600).kiq()
 ```
 
 ### Automatic Cleanup
-The broker automatically:
-- Sweeps stuck messages (messages without active locks) back to the queue
-- Cleans up expired completed messages
-- Handles connection failures with automatic reconnection
+A background sweep requeues messages whose heartbeat lease went stale, deletes completed
+messages past their TTL, and reconnects the dequeue connection when it drops.
 
 ## Benchmarking
 
@@ -241,8 +236,8 @@ bin/pg-down
 end-to-end : 15.363s (325.5 tasks/s)
 ```
 
-Note: the broker has no per-message lock, so with `-w > 1` every worker runs every
-task — use `-w 1` for a clean number. See `--help` and the module docstring for more.
+Note: the broker has no per-message lock, so with `-w > 1` every worker runs every task.
+Use `-w 1` for a clean number. See `--help` and the module docstring for more.
 
 ## Acknowledgements
 

@@ -1,23 +1,24 @@
-# Upgrade Notes: Enhanced PostgreSQL Features
+# Upgrade Notes
 
-This document describes the breaking changes and new features added to taskiq-pg inspired by SAQ's PostgreSQL implementation.
+What changed since 0.1.4, and what you have to do about it. The queue design follows
+SAQ's.
 
 ## Breaking Changes
 
 ### Database Schema Changes
 
-The broker now uses an enhanced database schema with additional columns:
+The broker's table carries these columns:
 
-- `status`: Tracks message state (queued, active, completed)
-- `scheduled_at`: Controls when messages become available for processing
-- `expire_at`: Automatic cleanup timestamp
-- `group_key`: For coordinating related messages
-- `retry_count`: Counts deliveries. Bumped by the claim, so a crashed attempt and a failed one draw on the same budget
-- `ordered`: Opt-in FIFO within a `group_key` (defaults to false, i.e. mutex only)
+- `status`: message state, one of queued, active, completed, dead
+- `scheduled_at`: when the message becomes available to claim
+- `expire_at`: when cleanup deletes a completed message
+- `group_key`: groups messages that must not run at the same time
+- `retry_count`: counts deliveries. The claim bumps it, so a crashed attempt and a failed one draw on the same budget
+- `ordered`: opt-in FIFO within a `group_key`, false by default, which leaves the group mutex on its own
 
-**Migration Required**: If you have existing messages in your database, you'll need to either:
-1. Drop and recreate the messages table (losing existing messages)
-2. Manually add the new columns with appropriate defaults
+Startup adds whichever of these an older table lacks. Their defaults are constants, so on
+PostgreSQL 11 and up each `ADD COLUMN` changes metadata and does not rewrite the table.
+The two exceptions are below.
 
 ### `id` widened to bigint
 
@@ -40,19 +41,32 @@ ALTER TABLE taskiq_messages ALTER COLUMN id TYPE BIGINT;
 ALTER SEQUENCE taskiq_messages_id_seq AS BIGINT;
 ```
 
-### `lock_key` dropped
+### `lock_key` stays int4 and cycles
 
-The column held the key for the row-level advisory lock that the claim used before
-`FOR UPDATE SKIP LOCKED`. No released version reads it, so startup drops it, and the drop
-removes the sequence it owned. Inserts no longer call `nextval` on it. Roll back to an
-older version and its own DDL adds the column again at startup, which costs a table
-rewrite, because a `SERIAL` default is volatile.
+The column holds the key for the row-level advisory lock that the claim used before
+`FOR UPDATE SKIP LOCKED`. Current code ignores it, but older clients still insert with
+`RETURNING id, lock_key` and then call `pg_try_advisory_lock(keyspace, lock_key)`. That
+is the two-int4 form. Widen the column and those clients get
+`function pg_try_advisory_lock(integer, bigint) does not exist` as soon as a value passes
+2 147 483 647, so the column keeps its `integer` type. They also reset a row to queued
+when the lock fails, so the values have to stay distinct between rows in flight, which
+rules out a constant default.
+
+Its sequence therefore cycles instead: `nextval` wraps from 2 147 483 647 back to 1
+rather than failing, and two rows collide only if both are in flight 2.1 billion inserts
+apart. Startup sets this, and you can set it ahead of time. It changes metadata only:
+
+```sql
+ALTER SEQUENCE taskiq_messages_lock_key_seq CYCLE;
+```
+
+Drop the column once no client reads it. Until then an insert pays one `nextval` for it.
 
 ### Attempt Counting
 
 `retry_count` is incremented when a message is claimed, not when it fails or when the
 sweeper reclaims it. One counter covers every reason an attempt ended, and
-`max_retry_attempts` bounds attempts rather than retries — a limit of 5 allows 5
+`max_retry_attempts` bounds attempts rather than retries: a limit of 5 allows 5
 executions, and a message that succeeds first time ends at 1.
 
 ### Retry Middleware
@@ -64,9 +78,9 @@ retry twice. Requires `taskiq>=0.11.20`. The sweeper now reads the per-message
 
 Migrating an existing `SmartRetryMiddleware` setup is not a drop-in swap. The cap comes
 from the `max_retries` label or the broker's `max_retry_attempts`, never from
-`default_retry_count` — the constructor still accepts it, but it does not control the
-budget, because the sweeper has to cap a crashed attempt without any middleware in the
-loop. Move `default_retry_count=N` to `max_retry_attempts=N` on the broker, or set
+`default_retry_count`. The constructor still accepts that argument, but it does not
+control the budget, because the sweeper has to cap a crashed attempt without any
+middleware in the loop. Move `default_retry_count=N` to `max_retry_attempts=N` on the broker, or set
 `max_retries` per task. `delay`, jitter and the exponent options carry over unchanged.
 
 ### Injected Labels
@@ -76,9 +90,9 @@ are added to the delivered copy, not to the stored body, and are reserved for th
 
 ### Retired Index
 
-`idx_<table>_status_scheduled` is dropped at startup. `idx_<table>_scheduled_id`
-supersedes it — `status` is constant inside a partial index on `status`, and the
-dequeue orders by `(scheduled_at, id)`.
+`idx_<table>_status_scheduled` is dropped at startup, because
+`idx_<table>_scheduled_id` supersedes it: `status` is constant inside a partial index on
+`status`, and the dequeue orders by `(scheduled_at, id)`.
 
 ### New Database Object
 
@@ -100,39 +114,43 @@ The `AsyncpgBroker` constructor now accepts additional parameters:
 - `enable_sweeping`: Enable automatic cleanup (default: True)
 - `sweep_interval`: Interval between sweep operations (default: 60)
 
-## New Features
+## Behaviour
 
-### 1. Atomic Message Claiming
-- Prevents duplicate message processing using `SELECT ... FOR UPDATE SKIP LOCKED`
-- Each message is claimed by exactly one worker; a heartbeat lease guards it during processing
-- A dead worker's stale lease is reclaimed by the sweeper and re-queued
+### Claiming
 
-### 2. Message States
-- `queued`: Message waiting to be processed
-- `active`: Message currently being processed
-- `completed`: Message has been acknowledged
+`SELECT ... FOR UPDATE SKIP LOCKED` inside the claim function gives a message to exactly
+one worker. The row then holds a heartbeat lease, and the sweeper requeues the lease of a
+worker that died.
 
-### 3. Scheduled Messages
-- Messages with a `delay` label are scheduled for future processing
-- The broker efficiently handles delayed messages without blocking
+### Message states
 
-### 4. Group Coordination
-- Messages with the same `group_key` won't be processed concurrently
-- Useful for ensuring sequential processing of related tasks
+`queued` waits to be claimed, `active` is running, `completed` is acknowledged and
+waiting for cleanup, and `dead` has spent its attempts and is never claimed again.
 
-### 5. Message TTL
-- Completed messages are automatically cleaned up after TTL expires
-- Configure per-message with the `ttl` label or globally via `message_ttl`
+### Scheduled messages
 
-### 6. Automatic Sweeping
-- Stuck messages (no active lock) are automatically returned to queue
-- Expired messages are cleaned up periodically
-- Configurable sweep interval and timeout
+A `delay` label sets `scheduled_at`, and the claim passes over the row until that time.
+Delayed messages sit in the same table and block nothing.
 
-### 7. Connection Resilience
-- Dedicated dequeue connection with health checks
-- Automatic reconnection on connection failures
-- Better connection pool management
+### Groups
+
+Two messages that share a `group_key` never run at the same time. Add `ordered=True` and
+the group runs in `id` order as well.
+
+### Message TTL
+
+Cleanup deletes a completed message once its `expire_at` passes. Set the window per
+message with the `ttl` label, or for every message with `message_ttl`.
+
+### Sweeping
+
+Every `sweep_interval` seconds the sweeper requeues messages whose lease went stale and
+deletes expired completed rows. `enable_sweeping=False` stops both.
+
+### Connections
+
+The broker keeps one connection for dequeuing, separate from the pool, checks its health
+before each claim, and reconnects when it drops.
 
 ## Usage Examples
 
@@ -155,18 +173,7 @@ await my_task.kicker().with_labels(ttl=3600).kiq()
 await my_task.kicker().with_labels(delay="300").kiq()
 ```
 
-## Performance Improvements
+## Logging
 
-- `FOR UPDATE SKIP LOCKED` for efficient concurrent dequeuing
-- Optimized indexes for message queries
-- Batch operations for cleanup tasks
-- Connection pooling best practices
-
-## Monitoring
-
-The broker logs important events:
-- Swept messages returned to queue
-- Connection health issues and reconnections
-- Expired message cleanup
-
-Monitor these logs to ensure your system is operating correctly.
+The broker logs the messages a sweep returns to the queue, connection failures and the
+reconnections that follow, and the count of expired messages it deleted.
