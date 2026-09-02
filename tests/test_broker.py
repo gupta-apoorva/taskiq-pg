@@ -118,7 +118,7 @@ async def test_listen(asyncpg_broker: AsyncpgBroker) -> None:
         INSERT INTO {asyncpg_broker.table_name}
         (task_id, task_name, message, labels, group_key, expire_at, scheduled_at)
         VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING id, lock_key
+        RETURNING id
         """,
         sent.task_id,
         sent.task_name,
